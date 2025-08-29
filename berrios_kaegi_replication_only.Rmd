@@ -1,0 +1,394 @@
+---
+title: "An Evaluation of Progress on Residential Assessment Fairness in Cook County: Code Replication"
+output: 
+  html_document:
+    df_print: paged
+    theme: sandstone
+author: "Mansueto Institute for Urban Innovation"
+---
+
+```{r data prep, include=FALSE, eval=FALSE}
+# prepare joined sales/av data, note the file paths are not going to work
+
+#open data sales https://datacatalog.cookcountyil.gov/Property-Taxation/Assessor-Parcel-Sales/wvhk-k5uv/about_data
+
+sales <- read_csv('Assessor_-_Parcel_Sales_20250226.csv')
+
+#2024 assessments
+
+base_url <- "https://datacatalog.cookcountyil.gov/resource/uzyt-m557.json"
+cur_assess <- GET(
+  base_url,
+  query = list(
+    year = 2024,
+    `$limit` = 2000000L,
+    `$select` = 'pin, year, class, township_code, mailed_tot, certified_tot, board_tot')
+)
+cur_assess <- fromJSON(rawToChar(cur_assess$content)) %>% tibble() %>% type_convert()
+
+#historic data ptaxsim
+ptaxsim_db_conn <- DBI::dbConnect(RSQLite::SQLite(), "/ptaxsim.db")
+ptax_data <- DBI::dbGetQuery(ptaxsim_db_conn, "SELECT pin, year, tax_code_num, class, tax_bill_total, 
+                             av_mailed, av_certified, av_board FROM pin where year >= 2006") %>% 
+  as_tibble()
+
+#township info
+base_url <- "https://datacatalog.cookcountyil.gov/resource/nj4t-kc8j.json"
+cur_uni <- GET(
+  base_url,
+  query = list(
+    `$where` = "year = 2006",
+    `$limit` = 50000000L,
+    `$select` = 'pin, year, triad_name, township_code')
+)
+cur_uni <- fromJSON(rawToChar(cur_uni$content)) %>% tibble() %>% type_convert()
+
+tri_town <- cur_uni %>% distinct(triad_name, township_code) %>%
+  filter(!is.na(township_code))
+
+pin_tri_town <- cur_uni %>% distinct(pin, township_code) %>%
+  bind_rows(
+    cur_assess %>% distinct(pin, township_code),
+    ptax_data %>% mutate(township_code = as.numeric(str_sub(tax_code_num, 1, 2))) %>%
+      distinct(pin, township_code)
+  ) %>%
+  distinct() %>%
+  mutate(pin10 = str_sub(pin, 1, 10)) %>%
+  select(-pin) %>%
+  left_join(tri_town) %>%
+  filter(!is.na(township_code)) %>%
+  distinct()
+
+#create joined file
+targ_class_sf <- c(
+  202, 203, 204, 205, 206, 207, 208, 209,
+  210, 211, 212, 234, 278, 295, 299
+)
+
+sales_mini <- sales %>% filter(
+  !sale_filter_deed_type,
+  !is_multisale,
+  class %in% targ_class_sf,
+  year >= 2006,
+  sale_price >= 10000
+) %>%
+  arrange(pin, year, desc(sale_price)) %>%
+  distinct(pin, year, .keep_all=TRUE) %>%
+  select(pin, year, class, sale_price)
+
+av_mini <- cur_assess %>% 
+  select(pin, year, class, 
+         av_mailed=mailed_tot,
+         av_certified=certified_tot, 
+         av_board=board_tot) %>%
+  bind_rows(ptax_data) %>%
+  mutate(pin10 = str_sub(pin, 1, 10)) %>%
+  left_join(pin_tri_town, 
+            join_by(pin10))
+
+joined <- sales_mini %>%
+  left_join(av_mini,
+            join_by(pin, year, class))
+
+joined %>% arrow::write_parquet('full_06_24.parquet')
+```
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, 
+                      message = FALSE, fig.width = 8, fig.height = 6)
+library(tidyverse)
+library(arrow)
+library(cmfproperty)
+ptaxsim_db_conn <- DBI::dbConnect(RSQLite::SQLite(), "/ptaxsim.db")
+
+theme_set(theme_bw())
+
+#sales ratio data
+
+joined <- arrow::read_parquet('full_06_24.parquet') %>%
+  filter(!is.na(av_mailed),
+         sale_price <= 10000000,
+         av_mailed > 2000,
+         sale_price >= 20000,
+         av_mailed / sale_price >= 0.01) %>% mutate(
+  assessor_term = case_when(
+    between(year, 1998, 2010) ~ 'Houlihan',
+    between(year, 2011, 2015) ~ 'Berrios',
+    between(year, 2016, 2018) ~ 'Berrios-Last RA',
+    between(year, 2019, 2021) ~ 'Kaegi-1st RA',
+    between(year, 2022, 2024) ~ 'Kaegi-2nd RA'
+  )
+)
+
+ratios_fp <- reformat_data(joined, 'sale_price', 'av_mailed', 'year', filter_data=TRUE) %>%
+  tibble()
+
+# av data
+
+historic_avs <- tbl(ptaxsim_db_conn, "pin") %>%
+  select(year, pin, class, tax_code_num, exe_homeowner,
+         tax_bill_total, av_mailed, av_certified, av_board) %>%
+  filter(year >= 2006) %>%
+  collect()
+
+## 2024 is not in ptaxsim yet
+avs <- arrow::open_csv_dataset('/open data/Assessor_-_Assessed_Values_20250610.csv',
+                               col_types = schema( pin = utf8() )) %>%
+  filter(tax_year == 2024) %>%
+  select(pin, class, year=tax_year, av_mailed=mailed_tot, 
+         av_certified=certified_tot, av_board=board_tot) %>%
+  collect()
+
+caption <- 'Mailed Values. Classes 202 through 212, 234, 278, 295.'
+
+make_table <- function(inputdata){
+    DT::datatable(
+      inputdata, extensions = 'Buttons', 
+      rownames = FALSE,
+      options = list(
+        dom = 'Bfrtip', 
+        buttons = c('excel', 'pdf'),
+        pageLength = 20))}
+```
+
+# Figure 2 / 3
+
+```{r}
+subt <- 'Berrios Last RA (2016-2018) and Kaegi 1st (2019-2021) and 2nd (2022-2024) RA'
+
+ratios_fp %>%
+  filter(between(SALE_YEAR, 2016, 2024), 
+         class != 299) %>%
+  group_by(assessor_term) %>%
+  mutate(bin = ntile(SALE_PRICE_ADJ, 20)) %>%
+  group_by(assessor_term, bin) %>%
+  summarize(
+    avg_price = mean(SALE_PRICE_ADJ),
+    avg_ratio = mean(RATIO)
+  ) %>%
+  ggplot(aes(x=avg_price, y=avg_ratio, color=assessor_term)) +
+  geom_point(size=1.5) +
+  geom_line(linewidth=1) +
+  scale_x_continuous(labels=scales::dollar) +
+  theme(legend.position='bottom') +
+  labs(x='Avg. Sale Price (2024 Dollars)', y='Avg. Ratio', color='Term', title='Comparison of Berrios and Kaegi Assessments',
+       subtitle=subt,
+       caption=caption)
+
+ratios_fp %>%
+  filter(between(SALE_YEAR, 2016, 2024), 
+         class != 299) %>%
+  group_by(assessor_term) %>%
+  mutate(bin = ntile(SALE_PRICE_ADJ, 20)) %>%
+  group_by(assessor_term, bin) %>%
+  summarize(
+    avg_price = mean(SALE_PRICE_ADJ),
+    avg_ratio = mean(RATIO)
+  ) %>% make_table()
+
+ratios_fp %>%
+  filter(between(SALE_YEAR, 2016, 2024),
+         class == 299) %>%
+  group_by(assessor_term) %>%
+  mutate(bin = ntile(SALE_PRICE_ADJ, 20)) %>%
+  group_by(assessor_term, bin) %>%
+  summarize(
+    avg_price = mean(SALE_PRICE_ADJ),
+    avg_ratio = mean(RATIO)
+  ) %>%
+  ggplot(aes(x=avg_price, y=avg_ratio, color=assessor_term)) +
+  geom_point(size=1.5) +
+  geom_line(linewidth=1) +
+  scale_x_continuous(labels=scales::dollar) +
+  theme(legend.position='bottom') +
+  labs(x='Avg. Sale Price (2024 Dollars)', y='Avg. Ratio', color='Term', title='Condominium Ratios',
+       subtitle=subt,
+       caption="Mailed Values, Condos (299) only.")
+
+ratios_fp %>%
+  filter(between(SALE_YEAR, 2016, 2024), 
+         class == 299) %>%
+  group_by(assessor_term) %>%
+  mutate(bin = ntile(SALE_PRICE_ADJ, 20)) %>%
+  group_by(assessor_term, bin) %>%
+  summarize(
+    avg_price = mean(SALE_PRICE_ADJ),
+    avg_ratio = mean(RATIO)
+  ) %>% make_table()
+```
+
+# Table 1
+
+Note, these numbers will vary slightly due to bootstrapping from the paper version.
+
+```{r}
+calc_stats_custom <- function(ratios){
+  stats <- data.frame()
+  for (y in sort(unique(ratios$SALE_YEAR))) {
+    mini_df <- ratios[ratios["SALE_YEAR"] == y, ]
+    new <- cmfproperty:::get_stats(mini_df, 20)
+    new["Year"] <- y
+    new["MAPE"] <- mini_df %>%
+      mutate(ape = abs(SALE_PRICE_ADJ - 10*ASSESSED_VALUE_ADJ) / SALE_PRICE_ADJ) %>%
+      summarize(mape = mean(ape, na.rm=T)) %>%
+      pull(mape)
+    stats <- rbind(stats, new)
+  }
+  return(stats)
+}
+
+results_overall <- ratios_fp %>%
+  filter(between(SALE_YEAR, 2016, 2024)) %>% 
+  mutate(SALE_YEAR = assessor_term) %>%
+  calc_stats_custom()
+
+results_overall %>% 
+  relocate(Year) %>% 
+  rename(Type = Year) %>% 
+  make_table()
+```
+
+# Figure 4
+
+City only. Within residential only. Shift calculated among properties which sold. Estimated total shift from the share of properties which sold which is then adjusted to the total size of residential pins, assuming the sales are proportionally representative of all properties. Adjusted to 2024 dollars.
+
+```{r}
+total_res_pins <- historic_avs %>%
+  filter(
+    class %in% c('202', '203', '204', '205', '206', 
+                 '207', '208', '209', '210', '211', 
+                 '212', '234', '278', '295', '299')
+  ) %>%
+  left_join(
+    joined %>% distinct(tax_code_num, township_code, triad_name) %>%
+  filter(!is.na(tax_code_num))
+  ) %>%
+  filter(!is.na(triad_name)) %>%
+  group_by(triad_name, year) %>%
+  summarize(total_res_pins = n())
+
+ratios_fp <- ratios_fp %>% 
+  mutate(TAX_FLAG = (!is.na(tax_bill_total)) & (tax_bill_total > 50),
+    TAX_RATE = tax_bill_total / SALE_PRICE)
+
+tax_ratios <- ratios_fp %>% filter(TAX_FLAG)
+
+tax_sum <- tax_ratios %>% 
+  group_by(SALE_YEAR, triad_name) %>%
+  mutate(bin = ntile(SALE_PRICE, 10)) %>%
+  group_by(SALE_YEAR, triad_name, bin) %>%
+  summarize(
+    count = n(),
+    total_sales = sum(SALE_PRICE_ADJ),
+    total_tax = sum(tax_bill_total * (ASSESSED_VALUE_ADJ / ASSESSED_VALUE))
+  ) %>%
+  mutate(
+    share_sales = total_sales / sum(total_sales),
+    share_tax = total_tax / sum(total_tax),
+    fair_tax = share_sales * sum(total_tax),
+    tax_shift = fair_tax - total_tax,
+    term = case_when(
+      between(SALE_YEAR, 2011, 2014) ~ 'Berrios 11-14',
+      between(SALE_YEAR, 2015, 2018) ~ 'Berrios 15-18',
+      between(SALE_YEAR, 2019, 2022) ~ 'Kaegi 19-22',
+      between(SALE_YEAR, 2023, 2024) ~ 'Kaegi 23-26 (est.)'
+    )
+  ) %>% filter(triad_name == 'City', !is.na(term))
+
+tax_sum <- tax_sum %>% left_join(total_res_pins, join_by(triad_name, SALE_YEAR == year)) %>%
+  group_by(SALE_YEAR) %>%
+  mutate(tax_shift = tax_shift * total_res_pins / (10 * max(count)))
+
+tax_sum %>%
+  group_by(bin, term) %>%
+  summarize(total_shift = sum(tax_shift)) %>%
+  mutate(total_shift = if_else(term == 'Kaegi 23-26 (est.)', total_shift * 4, total_shift)) %>%
+  mutate(shift_type = if_else(total_shift < 0, 'Overpaid', 'Underpaid')) %>%
+  ggplot(aes(x=bin, y=-total_shift/1e6, fill=shift_type)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~term) +
+  scale_x_continuous(breaks = scales::breaks_pretty(n=10)) +
+  scale_y_continuous(labels = scales::label_currency()) +
+  labs(x='Value Decile', y='Tax Shift ($M)',
+       fill = '',
+       caption = 'Chicago Only. Kaegi 23-26 is projected based on Tax Year 2023.',
+       title = 'Residential Tax Shift by Term: Kaegi More Equitable') +
+  theme(legend.position = 'bottom')
+
+tax_sum %>%
+  group_by(bin, term) %>%
+  summarize(total_shift = sum(tax_shift),
+            total_shift_pct = sum(fair_tax - total_tax) / sum(total_tax)) %>%
+  mutate(total_shift = round(if_else(term == 'Kaegi 23-26 (est.)', total_shift * 4, total_shift), 0),
+         total_shift_pct = scales::percent(total_shift_pct),
+         shift_type = if_else(total_shift < 0, 'Overpaid', 'Underpaid')) %>%
+  make_table()
+```
+
+# Figure 5A/5B
+
+```{r}
+summary_info <- historic_avs %>% bind_rows(
+  avs
+) %>% group_by(year, res = if_else(str_sub(class, 1, 1) == '2', 'res', 'com_other')) %>%
+  summarize(
+    total = n(),
+    total_mailed = sum(av_mailed),
+    total_certified = sum(av_certified),
+    total_board = sum(av_board)
+  ) %>%
+  pivot_wider(names_from = res, values_from=contains('total')) %>% 
+  mutate(pct_res_mailed = total_mailed_res / (total_mailed_res + total_mailed_com_other),
+                        pct_res_certified = total_certified_res / (total_certified_res + total_certified_com_other),
+                        pct_res_board = total_board_res / (total_board_res + total_board_com_other))
+
+summary_info %>%
+  select(year, contains('pct')) %>%
+  pivot_longer(!year) %>%
+  filter(year >= 2010) %>%
+  mutate(name = str_to_title(str_remove(name, 'pct_res_'))) %>%
+  ggplot(aes(x=year, y=value, color=name)) +
+  geom_point() +
+  geom_line() +
+  geom_vline(xintercept = 2019, linetype='dashed') +
+  scale_y_continuous(labels=scales::percent) +
+  labs(x='Year', y='Residential Share of Assessed Value Base', color='Stage',
+       title='Changes Made by Kaegi Undone by Board of Review ',
+       subtitle='2019, dashed', caption='Residential Property includes all class 200 properties.')
+
+summary_info %>%
+  select(year, !contains('pct'), -total_res, -total_com_other) %>%
+  pivot_longer(!year) %>%
+  filter(year >= 2010) %>%
+  mutate(
+         category = if_else(str_detect(name, '_res'), 'Res.', 'Com/Other'),
+         name = case_when(
+           str_detect(name, 'board') ~ 'Board',
+           str_detect(name, 'mailed') ~ 'Mailed',
+           TRUE ~ 'Certified'
+         )) %>%
+  ggplot(aes(x=year, y=value/1e9, color=name)) +
+  geom_point() +
+  geom_line() +
+  geom_vline(xintercept = 2019, linetype='dashed') +
+  facet_wrap(~category) +
+  labs(x='Year', y='Total Assessed Value (Billions)', color='Stage',
+       title='Changes Made by Kaegi Undone by Board of Review ',
+       subtitle='2019, dashed', caption='Residential Property includes all class 200 properties.')
+
+summary_info %>%
+  select(-total_res, -total_com_other) %>%
+  filter(year >= 2010) %>% make_table()
+```
+
+Notes:
+
+-	Classes included in residential: 202 through 212, 234, 278, 295, 299
+-	Sales filtered on deed type, including only transactions with one pin, sales greater than \$20,000 and less than \$10,000,000, and keeping only the highest value sale per pin per year
+- Due to historic data quality issues primarily around condominium sales, properties assessed at less than 2000 ($20,000 market value) and properties with sales ratios below 0.01 are excluded 
+-	Due to property reclassifications, about 250 sales between 2020 and 2022 are not included
+-	Due to delays in recording sales data, partial data is available for December 2023
+- All dollars are inflation adjusted to be in 2023 dollars
+- The IAAO Arm's Length Standard is applied to all sales year by year which filters out between 5% and 15% of sales as non-arm's length typically keeping ratios between 0.025 and 0.16.
